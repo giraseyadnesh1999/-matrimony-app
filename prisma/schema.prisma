@@ -1,0 +1,344 @@
+// Saathi matrimony data model.
+//
+// Privacy design notes (DPDP Act 2023):
+//  * Contact identifiers (email/phone) are AES-256-GCM encrypted (`*Enc`) and looked up through
+//    HMAC blind indexes (`*Hash`). A database leak alone does not expose them.
+//  * OTPs, session tokens and IPs are stored only as keyed hashes.
+//  * OAuth access/refresh tokens are never stored (data minimisation).
+//  * Every consent decision is an append-only row in ConsentRecord (proof of consent + withdrawal).
+//  * SQLite has no enums/lists, so enums are validated strings (see src/lib/reference) and lists are Json.
+//    Everything here is portable to PostgreSQL by changing only the datasource provider.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String    @id @default(cuid())
+  emailEnc             String?
+  emailHash            String?   @unique
+  phoneEnc             String?
+  phoneHash            String?   @unique
+  emailVerifiedAt      DateTime?
+  phoneVerifiedAt      DateTime?
+  /// ACTIVE | PENDING_DELETION | SUSPENDED
+  status               String    @default("ACTIVE")
+  deletionRequestedAt  DateTime?
+  /// USER_REQUEST | INACTIVITY
+  deletionReason       String?
+  deletionScheduledFor DateTime?
+  /// USER | ADMIN
+  role                 String    @default("USER")
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  lastLoginAt          DateTime?
+
+  profile           Profile?
+  preference        PartnerPreference?
+  nominee           Nominee?
+  sessions          Session[]
+  oauthAccounts     OAuthAccount[]
+  consents          ConsentRecord[]
+  interestsSent     Interest[]         @relation("InterestFrom")
+  interestsReceived Interest[]         @relation("InterestTo")
+  blocksMade        Block[]            @relation("Blocker")
+  blocksReceived    Block[]            @relation("Blocked")
+  reportsMade       Report[]           @relation("Reporter")
+  reportsReceived   Report[]           @relation("ReportTarget")
+  auditLogs         AuditLog[]
+
+  @@index([status, deletionScheduledFor])
+  @@index([lastLoginAt])
+}
+
+model OAuthAccount {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider          String
+  providerAccountId String
+  createdAt         DateTime @default(now())
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// SHA-256 of the opaque cookie token. The raw token exists only in the user's cookie.
+  tokenHash  String   @unique
+  /// otp-sms | otp-email | google | facebook
+  method     String
+  ipHash     String?
+  /// Truncated, for the "your devices" list only.
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+  expiresAt  DateTime
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model OtpChallenge {
+  id             String    @id @default(cuid())
+  identifierHash String
+  /// SMS | EMAIL
+  channel        String
+  /// HMAC(pepper, identifierHash:code)
+  codeHash       String
+  /// LOGIN | SIGNUP
+  intent         String
+  /// Consent decisions captured at signup, persisted only if the account is actually created.
+  consentPayload Json?
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(5)
+  expiresAt      DateTime
+  consumedAt     DateTime?
+  ipHash         String?
+  createdAt      DateTime  @default(now())
+
+  @@index([identifierHash, createdAt])
+  @@index([expiresAt])
+}
+
+model RateLimitBucket {
+  key     String   @id
+  count   Int
+  resetAt DateTime
+
+  @@index([resetAt])
+}
+
+/// Append-only consent ledger. Current state for a purpose = the newest row.
+model ConsentRecord {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose       String
+  granted       Boolean
+  noticeVersion String
+  /// signup | onboarding | settings | social-signup
+  source        String
+  ipHash        String?
+  createdAt     DateTime @default(now())
+
+  @@index([userId, purpose, createdAt])
+}
+
+model Profile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // --- basics
+  /// SELF | SON | DAUGHTER | BROTHER | SISTER | RELATIVE | FRIEND
+  profileFor     String
+  firstName      String
+  lastName       String?
+  /// FEMALE | MALE | OTHER
+  gender         String
+  dateOfBirth    DateTime
+  maritalStatus  String
+  /// NO | YES_WITH_ME | YES_NOT_WITH_ME (only when not never-married)
+  hasChildren    String?
+  heightCm       Int?
+  /// NORMAL | DISABILITY | NOT_SAID   (DISABILITY requires the health_disability consent)
+  physicalStatus String   @default("NOT_SAID")
+  disabilityNote String?
+
+  // --- religion & community
+  religion       String?
+  sect           String?
+  caste          String?
+  subCaste       String?
+  gotra          String?
+  motherTongue   String?
+  knownLanguages Json?
+
+  // --- horoscope (optional; requires the `horoscope` consent)
+  manglik    String?
+  rashi      String?
+  nakshatra  String?
+  birthTime  String?
+  birthPlace String?
+
+  // --- location
+  country         String  @default("IN")
+  /// ISO 3166-2:IN code without prefix, e.g. MH, KA, DL
+  state           String?
+  city            String?
+  /// RESIDENT | NRI | OCI_PIO | OTHER
+  residencyStatus String  @default("RESIDENT")
+
+  // --- education & career
+  education        String?
+  educationField   String?
+  institution      String?
+  occupationSector String?
+  occupation       String?
+  incomeBand       String?
+
+  // --- lifestyle
+  diet     String?
+  smoking  String?
+  drinking String?
+
+  // --- family
+  familyType       String?
+  familyValues     String?
+  fatherOccupation String?
+  motherOccupation String?
+  brothers         Int?
+  sisters          Int?
+
+  about String?
+
+  // --- visibility controls
+  /// Hidden profiles do not appear in search and cannot receive interests.
+  isHidden     Boolean @default(false)
+  /// Show only the initial of the surname to other members.
+  hideLastName Boolean @default(true)
+
+  completeness   Int       @default(0)
+  /// Number of onboarding steps completed
+  onboardingStep Int       @default(0)
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([gender, isHidden, completedAt])
+  @@index([religion])
+  @@index([state])
+  @@index([dateOfBirth])
+}
+
+model PartnerPreference {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  ageMin          Int?
+  ageMax          Int?
+  heightMinCm     Int?
+  heightMaxCm     Int?
+  maritalStatuses Json?
+  religions       Json?
+  motherTongues   Json?
+  states          Json?
+  diets           Json?
+  /// ANY | NO | YES
+  manglik         String   @default("ANY")
+  /// Caste / community "no bar"
+  casteNoBar      Boolean  @default(true)
+  about           String?
+  updatedAt       DateTime @updatedAt
+}
+
+model Interest {
+  id          String    @id @default(cuid())
+  fromUserId  String
+  from        User      @relation("InterestFrom", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUserId    String
+  to          User      @relation("InterestTo", fields: [toUserId], references: [id], onDelete: Cascade)
+  /// PENDING | ACCEPTED | DECLINED | WITHDRAWN
+  status      String    @default("PENDING")
+  createdAt   DateTime  @default(now())
+  respondedAt DateTime?
+
+  @@unique([fromUserId, toUserId])
+  @@index([toUserId, status])
+}
+
+model Block {
+  id        String   @id @default(cuid())
+  blockerId String
+  blocker   User     @relation("Blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blockedId String
+  blocked   User     @relation("Blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([blockerId, blockedId])
+  @@index([blockedId])
+}
+
+model Report {
+  id         String   @id @default(cuid())
+  reporterId String
+  reporter   User     @relation("Reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  targetId   String
+  target     User     @relation("ReportTarget", fields: [targetId], references: [id], onDelete: Cascade)
+  reason     String
+  details    String?
+  /// OPEN | REVIEWING | ACTIONED | DISMISSED
+  status     String   @default("OPEN")
+  createdAt  DateTime @default(now())
+
+  @@index([status, createdAt])
+}
+
+/// DPDP Act s.14: right to nominate someone to exercise rights in case of death or incapacity.
+model Nominee {
+  id         String   @id @default(cuid())
+  userId     String   @unique
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nameEnc    String
+  relation   String
+  contactEnc String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+/// Grievance redressal (DPDP Act s.13, IT Rules 2021 r.3(2)): acknowledge in 24h, resolve in 15 days.
+model GrievanceTicket {
+  id             String    @id @default(cuid())
+  /// Human friendly reference, e.g. GR-7K2M9QXA
+  reference      String    @unique
+  userId         String?
+  name           String
+  contactEnc     String
+  /// ACCESS | CORRECTION | ERASURE | CONSENT | PROFILE_ABUSE | OTHER
+  category       String
+  message        String
+  /// RECEIVED | ACKNOWLEDGED | RESOLVED | REJECTED
+  status         String    @default("RECEIVED")
+  acknowledgeBy  DateTime
+  resolveBy      DateTime
+  acknowledgedAt DateTime?
+  resolvedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([status, resolveBy])
+}
+
+/// Security/compliance audit trail. Never put raw PII in `meta`.
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  meta      Json?
+  ipHash    String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
+
+/// Proof that an erasure request was honoured, without retaining any personal data.
+model ErasureLog {
+  id          String    @id @default(cuid())
+  /// HMAC of the former user id
+  subjectHash String
+  /// USER_REQUEST | INACTIVITY
+  reason      String
+  requestedAt DateTime?
+  erasedAt    DateTime  @default(now())
+}
