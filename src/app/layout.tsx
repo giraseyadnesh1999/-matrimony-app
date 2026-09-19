@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Instrument_Serif } from "next/font/google";
 import { SITE } from "@/config/site";
 import { Providers } from "@/components/providers";
+import { RegisterServiceWorker } from "@/components/register-sw";
 import "./globals.css";
 
 // next/font self-hosts these files at build time: visitors' browsers never contact Google,
@@ -16,6 +17,8 @@ export const metadata: Metadata = {
   applicationName: SITE.name,
   robots: { index: true, follow: true },
   // Profiles are private to members; only marketing pages should be indexed.
+  appleWebApp: { capable: true, title: SITE.name, statusBarStyle: "default" },
+  icons: { apple: "/pwa/apple-180.png" },
   formatDetection: { telephone: false, email: false, address: false },
 };
 
@@ -40,6 +43,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           Skip to content
         </a>
         <Providers>{children}</Providers>
+        <RegisterServiceWorker />
       </body>
     </html>
   );
